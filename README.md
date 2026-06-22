@@ -23,6 +23,33 @@ from real sources: web URLs, files on an SFTP server (PDF/Word/etc.), and Notion
 
 ---
 
+## Architecture
+
+### RAG query pipeline
+
+```mermaid
+flowchart LR
+    Q["Question"] --> EMBED["Embed question<br/>(Ollama bge-m3)"]
+    EMBED --> SEARCH["Similarity search<br/>(pgvector, topK=4)"]
+    SEARCH --> CTX["Inject top chunks<br/>into prompt"]
+    CTX --> GEN["Generate answer<br/>(Ollama mistral)"]
+    GEN --> ANS["Grounded answer<br/>(or refusal)"]
+```
+
+### Ingestion / scheduler pipeline
+
+```mermaid
+flowchart LR
+    SCH["Scheduler<br/>(@Scheduled)"] --> SRC
+    API["POST /api/ingest/{source}"] --> SRC
+    SRC["Document sources<br/>URL · SFTP · Notion"] --> FETCH["Fetch documents"]
+    FETCH --> SPLIT["De-dup + split<br/>(TokenTextSplitter)"]
+    SPLIT --> EMB["Embed chunks<br/>(Ollama bge-m3)"]
+    EMB --> STORE["Store in pgvector"]
+```
+
+---
+
 ## Prerequisites
 
 - **Java 21** and the bundled Maven wrapper (`./mvnw`)
