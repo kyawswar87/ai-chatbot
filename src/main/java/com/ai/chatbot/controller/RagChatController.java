@@ -13,6 +13,9 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import reactor.core.publisher.Flux;
 
 /**
@@ -23,6 +26,7 @@ import reactor.core.publisher.Flux;
  */
 @RestController
 @RequestMapping("/api/chat")
+@Tag(name = "RAG Chat", description = "Ask questions answered strictly from the vector-store knowledge base")
 public class RagChatController {
 
 	/**
@@ -92,6 +96,9 @@ public class RagChatController {
 				.build();
 	}
 
+	@Operation(summary = "Ask a question (RAG)",
+			description = "Retrieves the top matching chunks from pgvector and answers strictly from them, "
+					+ "returning a single JSON answer. Declines questions it cannot ground in the knowledge base.")
 	@PostMapping
 	public AskResponse ask(@RequestBody AskRequest request) {
 		String answer = chatClient.prompt()
@@ -109,6 +116,9 @@ public class RagChatController {
 	 * Retrieval and the system prompt run before generation, so the grounding /
 	 * refusal behavior is identical to {@link #ask}; a refusal simply streams as text.
 	 */
+	@Operation(summary = "Ask a question (streaming)",
+			description = "Same RAG flow and grounding as POST /api/chat, but streams the answer as "
+					+ "Server-Sent Events: one `data: <token>` per generated chunk, terminated by `data: [DONE]`.")
 	@PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
 	public Flux<ServerSentEvent<String>> askStream(@RequestBody AskRequest request) {
 		return chatClient.prompt()
@@ -126,9 +136,16 @@ public class RagChatController {
 						ServerSentEvent.<String>builder("[ERROR] " + ex.getMessage()).build()));
 	}
 
-	public record AskRequest(String question) {
+	public record AskRequest(
+			@Schema(description = "The question to answer from the knowledge base",
+					example = "What problem does retrieval-augmented generation reduce?",
+					requiredMode = Schema.RequiredMode.REQUIRED)
+			String question) {
 	}
 
-	public record AskResponse(String answer) {
+	public record AskResponse(
+			@Schema(description = "Answer grounded in the retrieved context, or a fixed refusal line",
+					example = "Retrieval-augmented generation reduces hallucination by grounding answers in retrieved context.")
+			String answer) {
 	}
 }

@@ -82,6 +82,11 @@ The API is then available at `http://localhost:8080`.
 
 ## API
 
+Interactive API docs (Swagger UI) are available once the app is running:
+
+- **Swagger UI:** `http://localhost:8080/swagger-ui.html`
+- **OpenAPI JSON:** `http://localhost:8080/v3/api-docs`
+
 ### Ingest documents from a source — `POST /api/ingest/{source}`
 `{source}` is `url`, `sftp`, or `notion`. The JSON body carries source-specific params.
 
