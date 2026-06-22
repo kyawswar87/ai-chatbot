@@ -1,0 +1,32 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: ai-chatbot-pgvector
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-chatbot}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    # Host port 5433 avoids colliding with a native (Homebrew) Postgres on 5432.
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-chatbot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Local SFTP server for exercising the SftpDocumentSource connector.
+  # user "demo" / password "demo"; ./sftp-data/docs is served as /docs.
+  sftp:
+    image: atmoz/sftp:alpine
+    container_name: ai-chatbot-sftp
+    ports:
+      - "2222:22"
+    volumes:
+      - ./sftp-data/docs:/home/demo/docs
+    command: demo:demo:1001
+
+volumes:
+  pgvector_data:
