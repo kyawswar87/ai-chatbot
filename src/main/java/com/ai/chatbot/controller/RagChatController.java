@@ -92,7 +92,7 @@ public class RagChatController {
 						.topK(4)
 						.similarityThreshold(SIMILARITY_THRESHOLD)
 						.build())
-				.promptTemplate(QA_PROMPT_TEMPLATE)
+				// .promptTemplate(QA_PROMPT_TEMPLATE)
 				.build();
 	}
 

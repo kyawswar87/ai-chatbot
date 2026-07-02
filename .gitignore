@@ -30,7 +30,3 @@ build/
 
 ### VS Code ###
 .vscode/
-
-### Local SFTP fixtures: keep the bundled sample, ignore anything you drop in ###
-sftp-data/docs/*
-!sftp-data/docs/project-nimbus-runbook.pdf
