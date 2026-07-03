@@ -39,6 +39,11 @@
 			<groupId>org.springframework.ai</groupId>
 			<artifactId>spring-ai-starter-model-ollama</artifactId>
 		</dependency>
+		<!-- Spring AOP (AspectJ): powers the ChatGuardAspect that classifies every chat request -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-aspectj</artifactId>
+		</dependency>
 		<dependency>
 			<groupId>org.springframework.ai</groupId>
 			<artifactId>spring-ai-starter-vector-store-pgvector</artifactId>
