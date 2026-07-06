@@ -282,6 +282,77 @@ psql "postgresql://postgres:postgres@127.0.0.1:5433/chatbot" \
 
 ---
 
+## Evaluating answer quality
+
+Model-evaluation tests score the RAG pipeline's answers with two Spring AI LLM-as-judge
+evaluators, run against the bundled loyalty-platform knowledge base:
+
+- **`RelevancyEvaluator`** — is the answer relevant to the question given the retrieved context?
+  Judged by `llama3.2` (a model separate from the `mistral` generator, so it doesn't grade itself).
+- **`FactCheckingEvaluator`** — are the answer's claims actually supported by the retrieved
+  context (not hallucinated)? Judged by `llama3.2` using the general-purpose fact-checking prompt.
+
+They live in `src/test/java/com/ai/chatbot/eval/RagEvaluationTests.java` and are **opt-in** (gated
+by `RAG_EVAL=true`) since they need Ollama, pgvector, and the judge model. Plain `./mvnw test`
+skips them.
+
+### Running the eval tests
+
+**Prerequisites** (all must be up first):
+
+- pgvector DB running — `docker compose up -d db`
+- Ollama running with the models: `mistral` (generator), `bge-m3` (embeddings), `llama3.2` (judge).
+  Pull the judge if needed: `ollama pull llama3.2`
+- The knowledge base already ingested, e.g.:
+  `curl -X POST localhost:8080/api/ingest/sftp -H 'Content-Type: application/json' -d '{}'`
+
+**Run:**
+
+```bash
+# All eval cases
+RAG_EVAL=true ./mvnw test -Dtest=RagEvaluationTests
+
+# A single parameterized method (all its questions)
+RAG_EVAL=true ./mvnw test -Dtest='RagEvaluationTests#answersAreRelevantAndFactuallyGrounded'
+
+# Whole suite (drop -Dtest); the eval class still needs RAG_EVAL=true or it is skipped
+RAG_EVAL=true ./mvnw test
+```
+
+- **`RAG_EVAL=true` is required** — without it the class is disabled and reported as *skipped*
+  (`Time elapsed: 0 s`, no output). That is why a plain `./mvnw test` shows nothing for it.
+- **From an IDE:** add the environment variable `RAG_EVAL=true` to the run configuration, then run
+  the class normally. Without it the IDE will also skip it.
+
+### HTML report
+
+Each case logs a readable block (question, retrieved chunks, model answer, relevancy/fact-check
+verdicts) to its captured output. Turn a run into a browsable HTML report with the
+`maven-surefire-report-plugin`:
+
+```bash
+# 1. Run the eval once (writes target/surefire-reports/*.xml)
+RAG_EVAL=true ./mvnw test -Dtest=RagEvaluationTests
+
+# 2. Render the HTML from those results — no re-run, no Ollama/pgvector needed
+./mvnw surefire-report:report-only
+# → open target/reports/surefire.html
+```
+
+Each test case in the report expands to its captured output, which contains the question, the model
+answer, and the evaluation results — for passing and failing cases alike. (One-shot alternative that
+runs *and* renders: `RAG_EVAL=true ./mvnw surefire-report:report -Dtest=RagEvaluationTests`.)
+
+The test queries the **existing** pgvector store (it does not ingest or modify any data), runs a set
+of ground-truth questions through the exact production pipeline, and asserts each answer passes both
+evaluators. If the store is empty the retrieval assertion fails with a hint to ingest first.
+Overridable via env: `RAG_EVAL_RELEVANCY_MODEL` (default `llama3.2`), `RAG_EVAL_FACTCHECK_MODEL`
+(default `llama3.2`). For a purpose-built fact-checker, pull
+[`bespoke-minicheck`](https://ollama.com/blog/reduce-hallucinations-with-bespoke-minicheck) and
+switch the fact-check evaluator to `FactCheckingEvaluator.forBespokeMinicheck(...)`.
+
+---
+
 ## Notes & follow-ups
 
 - **SFTP host-key verification is disabled** (`setAllowUnknownKeys(true)`) — fine for the local

@@ -32,8 +32,11 @@ public class RagChatController {
 	/**
 	 * Constrains the assistant to answer strictly from the retrieved vector-store
 	 * context and to decline questions it cannot ground in that context.
+	 *
+	 * <p>Public so evaluation tests can drive the exact same pipeline
+	 * (see {@code RagEvaluationTests}).
 	 */
-	private static final String SYSTEM_PROMPT = """
+	public static final String SYSTEM_PROMPT = """
 			You are a knowledge-base assistant. You answer questions strictly and only using the
 			information contained in the provided context (retrieved from the vector store).
 
@@ -59,7 +62,7 @@ public class RagChatController {
 	 * similarity threshold the context block is blank, and the model is told to fall
 	 * back to the fixed refusal line instead of answering from prior knowledge.
 	 */
-	private static final PromptTemplate QA_PROMPT_TEMPLATE = new PromptTemplate("""
+	public static final PromptTemplate QA_PROMPT_TEMPLATE = new PromptTemplate("""
 			Context information is below, surrounded by ---------------------
 
 			---------------------
@@ -76,7 +79,13 @@ public class RagChatController {
 	 * context. Weakly-matching chunks are dropped so off-topic questions retrieve no
 	 * context and trigger the refusal. Tune to the corpus if recall/precision shifts.
 	 */
-	private static final double SIMILARITY_THRESHOLD = 0.5;
+	public static final double SIMILARITY_THRESHOLD = 0.5;
+
+	/**
+	 * Number of top matching chunks retrieved to ground each answer. Exposed so
+	 * evaluation tests retrieve the same context the advisor uses.
+	 */
+	public static final int TOP_K = 4;
 
 	private final ChatClient chatClient;
 	private final QuestionAnswerAdvisor qaAdvisor;
@@ -88,7 +97,7 @@ public class RagChatController {
 		// prompt template fall back to the refusal line.
 		this.qaAdvisor = QuestionAnswerAdvisor.builder(vectorStore)
 				.searchRequest(SearchRequest.builder()
-						.topK(4)
+						.topK(TOP_K)
 						.similarityThreshold(SIMILARITY_THRESHOLD)
 						.build())
 				.promptTemplate(QA_PROMPT_TEMPLATE)
