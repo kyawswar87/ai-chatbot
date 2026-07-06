@@ -38,8 +38,9 @@ import com.ai.chatbot.controller.RagChatController;
  *       retrieved context? Judged by {@code llama3.2}, a model separate from the
  *       generator ({@code mistral}) so it does not grade its own output.</li>
  *   <li>{@link FactCheckingEvaluator} — are the answer's claims supported by the
- *       retrieved context (i.e. not hallucinated)? Judged by {@code llama3.2} using the
- *       general-purpose fact-checking prompt.</li>
+ *       retrieved context (i.e. not hallucinated)? Judged by {@code bespoke-minicheck},
+ *       a model purpose-built by Bespoke Labs for grounded-factuality checking, via
+ *       {@link FactCheckingEvaluator#forBespokeMinicheck}.</li>
  * </ul>
  *
  * <p>The test queries the <strong>existing</strong> pgvector store — it does not ingest
@@ -53,7 +54,8 @@ import com.ai.chatbot.controller.RagChatController;
  * fast and infra-free.
  *
  * <pre>{@code
- *   ollama pull llama3.2   # judge (skip if already present)
+ *   ollama pull llama3.2           # relevancy judge (skip if already present)
+ *   ollama pull bespoke-minicheck  # fact-check judge (skip if already present)
  *   docker compose up -d db
  *   # ensure the KB is ingested, e.g.:
  *   curl -X POST localhost:8080/api/ingest/sftp -H 'Content-Type: application/json' -d '{}'
@@ -61,9 +63,7 @@ import com.ai.chatbot.controller.RagChatController;
  * }</pre>
  *
  * <p>Overridable via env: {@code RAG_EVAL_RELEVANCY_MODEL} (default {@code llama3.2}),
- * {@code RAG_EVAL_FACTCHECK_MODEL} (default {@code llama3.2}). To use the purpose-built
- * fact-checker instead, pull {@code bespoke-minicheck} and swap the fact-check evaluator
- * to {@code FactCheckingEvaluator.forBespokeMinicheck(...)}.
+ * {@code RAG_EVAL_FACTCHECK_MODEL} (default {@code bespoke-minicheck}).
  */
 @SpringBootTest(properties = {
 		// Quiet the framework's DEBUG chatter so each case's captured System.out — which the
@@ -98,23 +98,6 @@ class RagEvaluationTests {
 			{context}
 			""");
 
-	/**
-	 * Fact-check judge prompt. Forces a single bare {@code yes}/{@code no} so the evaluator's
-	 * exact match still works when a judge would otherwise add a trailing period or rationale
-	 * (e.g. {@code "Yes."}). Placeholders {@code {document}}, {@code {claim}} are filled by the evaluator.
-	 */
-	private static final String FACT_CHECK_PROMPT = """
-			Determine whether the CLAIM is supported by the DOCUMENT.
-			Respond with a single word: yes or no. No punctuation, no explanation, no other text.
-			Answer "yes" if the DOCUMENT supports the CLAIM; otherwise "no".
-
-			DOCUMENT:
-			{document}
-
-			CLAIM:
-			{claim}
-			""";
-
 	@Autowired
 	private ChatModel chatModel;
 
@@ -141,23 +124,25 @@ class RagEvaluationTests {
 		// Judges reuse the autoconfigured Ollama ChatModel, overriding only the model
 		// name per judge so no extra beans/wiring are needed.
 		String relevancyModel = envOrDefault("RAG_EVAL_RELEVANCY_MODEL", "llama3.2");
-		String factCheckModel = envOrDefault("RAG_EVAL_FACTCHECK_MODEL", "llama3.2");
+		String factCheckModel = envOrDefault("RAG_EVAL_FACTCHECK_MODEL", "bespoke-minicheck");
 
+		// Relevancy still uses an explicit single-word prompt because Spring AI's terse
+		// default makes small judge models answer incorrectly or add punctuation, and the
+		// evaluator requires an exact "yes"/"no" reply.
 		this.relevancyEvaluator = RelevancyEvaluator.builder()
 				.chatClientBuilder(ChatClient.builder(chatModel)
 						.defaultOptions(OllamaChatOptions.builder().model(relevancyModel)))
 				.promptTemplate(RELEVANCY_PROMPT)
 				.build();
 
-		// General-purpose fact-check (not forBespokeMinicheck, which is tuned to the
-		// bespoke-minicheck model). Both judges use explicit single-word prompts because
-		// Spring AI's terse defaults make small judge models answer incorrectly or add
-		// punctuation, and the evaluators require an exact "yes"/"no" reply.
-		this.factCheckingEvaluator = FactCheckingEvaluator.builder(
+		// Fact-check uses bespoke-minicheck, a model purpose-built for grounded-factuality
+		// checking. forBespokeMinicheck installs the bare Document/Claim prompt the model was
+		// trained on (no custom prompt — that would defeat its tuning); the model still comes
+		// from the OllamaChatOptions here. It emits "Yes"/"No", which the evaluator matches
+		// with strip()+equalsIgnoreCase.
+		this.factCheckingEvaluator = FactCheckingEvaluator.forBespokeMinicheck(
 				ChatClient.builder(chatModel)
-						.defaultOptions(OllamaChatOptions.builder().model(factCheckModel)))
-				.evaluationPrompt(FACT_CHECK_PROMPT)
-				.build();
+						.defaultOptions(OllamaChatOptions.builder().model(factCheckModel)));
 	}
 
 	@ParameterizedTest(name = "[{index}] {0}")
@@ -222,9 +207,10 @@ class RagEvaluationTests {
 
 		sb.append("\n--- MODEL OUTPUT (generator: mistral) ---\n").append(answer.strip()).append('\n');
 
-		sb.append("\n--- JUDGES (llama3.2) ---\n");
-		sb.append(String.format("  Relevancy : pass=%s (score=%.1f)%n", relevancy.isPass(), relevancy.getScore()));
-		sb.append(String.format("  FactCheck : pass=%s%n", factuality.isPass()));
+		sb.append("\n--- JUDGES ---\n");
+		sb.append(String.format("  Relevancy (llama3.2)         : pass=%s (score=%.1f)%n",
+				relevancy.isPass(), relevancy.getScore()));
+		sb.append(String.format("  FactCheck (bespoke-minicheck): pass=%s%n", factuality.isPass()));
 		sb.append("=============================================================\n");
 		System.out.println(sb);
 	}
