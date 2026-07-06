@@ -112,6 +112,13 @@
 					</excludes>
 				</configuration>
 			</plugin>
+			<!-- Renders JUnit results (incl. each test's captured System.out) into an HTML report.
+			     Run `./mvnw surefire-report:report-only` after a test run to generate it. -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-report-plugin</artifactId>
+				<version>3.5.6</version>
+			</plugin>
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-compiler-plugin</artifactId>
