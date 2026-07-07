@@ -2,10 +2,7 @@ package com.ai.chatbot.controller;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;
-import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.prompt.PromptTemplate;
-import org.springframework.ai.vectorstore.SearchRequest;
-import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -17,6 +14,8 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 /**
  * Retrieval-Augmented Generation endpoint. The {@link QuestionAnswerAdvisor}
@@ -88,20 +87,14 @@ public class RagChatController {
 	public static final int TOP_K = 4;
 
 	private final ChatClient chatClient;
-	private final QuestionAnswerAdvisor qaAdvisor;
 
-	public RagChatController(ChatModel chatModel, VectorStore vectorStore) {
-		this.chatClient = ChatClient.builder(chatModel).build();
-		// Retrieve up to top-K chunks that clear the similarity threshold so only
-		// genuinely relevant context grounds the answer; an empty result lets the
-		// prompt template fall back to the refusal line.
-		this.qaAdvisor = QuestionAnswerAdvisor.builder(vectorStore)
-				.searchRequest(SearchRequest.builder()
-						.topK(TOP_K)
-						.similarityThreshold(SIMILARITY_THRESHOLD)
-						.build())
-				.promptTemplate(QA_PROMPT_TEMPLATE)
-				.build();
+	/**
+	 * The shared RAG {@link ChatClient} (see {@code ChatClientConfig}) already carries the
+	 * system prompt and default advisors: the self-refinement guardrail wrapped around the
+	 * {@link QuestionAnswerAdvisor}. Endpoints just supply the user question.
+	 */
+	public RagChatController(ChatClient ragChatClient) {
+		this.chatClient = ragChatClient;
 	}
 
 	@Operation(summary = "Ask a question (RAG)",
@@ -110,8 +103,6 @@ public class RagChatController {
 	@PostMapping
 	public AskResponse ask(@RequestBody AskRequest request) {
 		String answer = chatClient.prompt()
-				.system(SYSTEM_PROMPT)
-				.advisors(qaAdvisor)
 				.user(request.question())
 				.call()
 				.content();
@@ -119,27 +110,30 @@ public class RagChatController {
 	}
 
 	/**
-	 * Streaming variant of {@link #ask}. Emits the answer as Server-Sent Events —
-	 * one {@code data: <token>} per generated chunk, terminated by {@code data: [DONE]}.
-	 * Retrieval and the system prompt run before generation, so the grounding /
-	 * refusal behavior is identical to {@link #ask}; a refusal simply streams as text.
+	 * Streaming variant of {@link #ask}, delivered as Server-Sent Events terminated by
+	 * {@code data: [DONE]}. Because the self-refinement guardrail must evaluate the
+	 * <em>complete</em> answer before it can be trusted (and may recursively rewrite it),
+	 * this endpoint <strong>buffers</strong>: it runs the same blocking, refined RAG
+	 * generation as {@link #ask}, then emits the final answer as a single {@code data:}
+	 * event. Token-by-token streaming is intentionally traded away for the guardrail.
 	 */
 	@Operation(summary = "Ask a question (streaming)",
-			description = "Same RAG flow and grounding as POST /api/chat, but streams the answer as "
-					+ "Server-Sent Events: one `data: <token>` per generated chunk, terminated by `data: [DONE]`.")
+			description = "Same RAG flow, grounding and guardrail as POST /api/chat. The answer is "
+					+ "buffered and refined, then emitted as a single Server-Sent Event terminated by `data: [DONE]`.")
 	@PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
 	public Flux<ServerSentEvent<String>> askStream(@RequestBody AskRequest request) {
-		return chatClient.prompt()
-				.system(SYSTEM_PROMPT)
-				.advisors(qaAdvisor)
-				.user(request.question())
-				.stream()
-				.content()
-				.filter(token -> !token.isEmpty())
-				.map(token -> ServerSentEvent.builder(token).build())
-				.concatWithValues(ServerSentEvent.<String>builder("[DONE]").build())
-				// The response has already started once tokens flow, so ApiExceptionHandler
-				// cannot map a mid-stream failure — surface it as a terminal SSE event.
+		// Blocking generation (guard + refine) runs off the event loop, then the final
+		// answer is emitted as one SSE data event followed by the [DONE] sentinel.
+		return Mono.fromCallable(() -> chatClient.prompt()
+						.user(request.question())
+						.call()
+						.content())
+				.subscribeOn(Schedulers.boundedElastic())
+				.flatMapMany(answer -> Flux.just(
+						ServerSentEvent.<String>builder(answer).build(),
+						ServerSentEvent.<String>builder("[DONE]").build()))
+				// Generation happens before any event is emitted, so a failure surfaces as a
+				// terminal [ERROR] SSE event (ApiExceptionHandler cannot map a streamed error).
 				.onErrorResume(ex -> Flux.just(
 						ServerSentEvent.<String>builder("[ERROR] " + ex.getMessage()).build()));
 	}
