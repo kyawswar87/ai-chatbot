@@ -31,7 +31,7 @@ public class ChatClientConfig {
 						.topK(RagChatController.TOP_K)
 						.similarityThreshold(RagChatController.SIMILARITY_THRESHOLD)
 						.build())
-				// .promptTemplate(RagChatController.QA_PROMPT_TEMPLATE)
+				.promptTemplate(RagChatController.QA_PROMPT_TEMPLATE)
 				.build();
 	}
 
