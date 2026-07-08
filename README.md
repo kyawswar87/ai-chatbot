@@ -18,7 +18,9 @@ from real sources: web URLs, files on an SFTP server (PDF/Word/etc.), and Notion
 | AI framework | Spring AI 2.0.0 |
 | Vector store | PostgreSQL 17 + `pgvector` (HNSW, cosine) |
 | Embeddings | Ollama `bge-m3` (1024-dim) |
-| Chat model | Ollama `mistral` |
+| Chat model | Ollama `mistral` (generation + answer refinement) |
+| Safety guard | Ollama `llama-guard3` (jailbreak / unsafe screening) |
+| Relevancy judge | Ollama `llama3.2` (off-topic screening + answer grading) |
 | Doc parsing | Apache Tika (files), Jsoup (HTML) |
 
 ---
@@ -29,12 +31,23 @@ from real sources: web URLs, files on an SFTP server (PDF/Word/etc.), and Notion
 
 ```mermaid
 flowchart LR
-    Q["Question"] --> EMBED["Embed question<br/>(Ollama bge-m3)"]
+    Q["Question"] --> GUARD{"Input guard<br/>llama-guard3 (safety)<br/>+ llama3.2 (off-topic)"}
+    GUARD -->|blocked| REFUSE["Fixed refusal"]
+    GUARD -->|allowed| EMBED["Embed question<br/>(Ollama bge-m3)"]
     EMBED --> SEARCH["Similarity search<br/>(pgvector, topK=4)"]
     SEARCH --> CTX["Inject top chunks<br/>into prompt"]
     CTX --> GEN["Generate answer<br/>(Ollama mistral)"]
-    GEN --> ANS["Grounded answer<br/>(or refusal)"]
+    GEN --> JUDGE{"Relevancy judge<br/>(llama3.2)"}
+    JUDGE -->|pass| ANS["Grounded answer"]
+    JUDGE -->|fail| REFINE["Refine answer<br/>(mistral, up to N)"]
+    REFINE --> JUDGE
+    JUDGE -->|still failing| REFUSE
 ```
+
+The guardrail (`SelfRefinementAdvisor`) wraps the retrieval + generation core: it screens the
+question **before** any model call and evaluates/refines the answer **after** generation. It can
+be turned off with `GUARDRAIL_ENABLED=false`, which reverts to the plain embed→search→generate
+flow.
 
 ### Ingestion / scheduler pipeline
 
@@ -54,12 +67,16 @@ flowchart LR
 
 - **Java 21** and the bundled Maven wrapper (`./mvnw`)
 - **Docker** (for Postgres/pgvector and the demo SFTP server)
-- **[Ollama](https://ollama.com)** running locally, with the two models pulled:
+- **[Ollama](https://ollama.com)** running locally, with the models pulled:
   ```bash
-  ollama pull bge-m3      # embeddings (1024-dim)
-  ollama pull mistral     # chat / generation
+  ollama pull bge-m3       # embeddings (1024-dim)
+  ollama pull mistral      # chat / generation + answer refinement
+  ollama pull llama-guard3 # guardrail: jailbreak / unsafe screening
+  ollama pull llama3.2     # guardrail: off-topic screening + relevancy judge
   ```
   > On first startup the app also auto-pulls missing models (`pull-model-strategy=when_missing`).
+  > The two guardrail models are only needed when the guardrail is enabled (the default);
+  > set `GUARDRAIL_ENABLED=false` to run the plain RAG pipeline without them.
 
 ---
 
@@ -127,16 +144,17 @@ curl -X POST localhost:8080/api/chat -H 'Content-Type: application/json' \
 ```
 
 ### Ask a question (streaming) — `POST /api/chat/stream`
-Same RAG flow and [grounding](#answer-grounding) as `/api/chat`, but streams the answer as
-**Server-Sent Events** (`text/event-stream`): one `data: <token>` event per generated chunk,
-terminated by `data: [DONE]`. Use `curl -N` to disable buffering and watch tokens arrive live.
+Same RAG flow, [grounding](#answer-grounding) and guardrail as `/api/chat`, delivered over
+**Server-Sent Events** (`text/event-stream`). Because the self-refinement guardrail must see the
+**complete** answer before it can judge/refine it, this endpoint **buffers**: it runs the same
+guarded + refined blocking generation, then emits the final answer as a **single** `data: <answer>`
+event terminated by `data: [DONE]`. (Token-by-token streaming is intentionally traded away for the
+guardrail; use `curl -N` to consume the events.)
 ```bash
 curl -N -X POST localhost:8080/api/chat/stream \
   -H 'Content-Type: application/json' \
   -d '{"question":"What problem does retrieval-augmented generation reduce?"}'
-# → data: Retrieval
-#   data:  reduces
-#   data:  ...
+# → data: Retrieval-augmented generation reduces hallucination by grounding answers in retrieved context.
 #   data: [DONE]
 ```
 
@@ -159,28 +177,42 @@ curl "localhost:8080/api/vectors/search?query=vector%20search&topK=3"
 
 ```
 POST /api/chat {"question": "..."}
-   └─ QuestionAnswerAdvisor embeds the question (Ollama bge-m3)
-       └─ similarity search in pgvector → top-K chunks above the threshold
-           └─ chunks injected into the prompt as context
-               └─ Ollama mistral generates a grounded answer (or declines)
+   └─ SelfRefinementAdvisor screens the question (llama-guard3 + llama3.2)
+       │  ↳ jailbreak/unsafe or off-topic → fixed refusal, no retrieval/generation
+       └─ QuestionAnswerAdvisor embeds the question (Ollama bge-m3)
+           └─ similarity search in pgvector → top-K chunks above the threshold
+               └─ chunks injected into the prompt as context
+                   └─ Ollama mistral generates a grounded answer (or declines)
+                       └─ SelfRefinementAdvisor judges relevancy (llama3.2);
+                          on failure, refines with mistral up to N times, else refuses
 ```
 
-The answer is returned either as one JSON payload (`POST /api/chat`) or streamed token-by-token
-over SSE (`POST /api/chat/stream`); both share the same retrieval and grounding pipeline.
+The answer is returned either as one JSON payload (`POST /api/chat`) or as a single buffered SSE
+event (`POST /api/chat/stream`); both share the same retrieval, grounding and guardrail pipeline.
 
 ### Answer grounding
 
 `RagChatController` is locked down to answer **only** from the vector store and to refuse
-anything it can't ground there. Three reinforcing layers make this robust rather than relying
+anything it can't ground there. Several reinforcing layers make this robust rather than relying
 on a single soft instruction:
 
-1. **System prompt** — instructs the model to use only the supplied context, never prior
+1. **Input guard** (`SelfRefinementAdvisor` → `InputGuard`) — before any retrieval, the
+   question is screened by `llama-guard3` (jailbreak / unsafe content) and an `llama3.2`
+   off-topic classifier. A denial short-circuits with a fixed refusal, so no retrieval or
+   generation happens.
+2. **System prompt** — instructs the model to use only the supplied context, never prior
    knowledge, and to decline unrelated questions.
-2. **Similarity threshold** (`similarityThreshold = 0.5`) — chunks below the cutoff are
+3. **Similarity threshold** (`similarityThreshold = 0.5`) — chunks below the cutoff are
    dropped, so off-topic questions retrieve **no** context. Tune to the corpus if in-domain
    questions get wrongly refused (lower it) or off-topic answers leak through (raise it).
-3. **Custom advisor prompt template** — when the context is empty or lacks the answer, the
+4. **Custom advisor prompt template** — when the context is empty or lacks the answer, the
    model is told to return a fixed refusal line instead of guessing.
+5. **Output self-refinement** (`SelfRefinementAdvisor` → `ResponseRefiner`) — the generated
+   answer is graded by an `llama3.2` relevancy judge; if it fails, it is recursively rewritten
+   with `mistral` up to `maxRefinementIterations` times, falling back to the refusal line.
+
+All guardrail layers (1 and 5) can be disabled with `GUARDRAIL_ENABLED=false`; the prompt- and
+threshold-based layers (2–4) always apply.
 
 Resulting refusal lines:
 - Topic not in the knowledge base → `"I don't have information about that in my knowledge base."`
@@ -237,6 +269,10 @@ environment variables (defaults shown).
 | `INGEST_SCHEDULE_ENABLED` | `false` | Enable scheduled URL re-sync |
 | `INGEST_SCHEDULE_CRON` | `0 0 * * * *` | Re-sync cron |
 | `INGEST_SCHEDULE_URLS` | _(empty)_ | Comma-separated URLs to re-sync |
+| `GUARDRAIL_ENABLED` | `true` | Enable input guard + output self-refinement |
+| `GUARDRAIL_GUARD_MODEL` | `llama-guard3` | Safety / jailbreak classifier |
+| `GUARDRAIL_JUDGE_MODEL` | `llama3.2` | Off-topic classifier + relevancy judge |
+| `GUARDRAIL_MAX_REFINEMENT_ITERATIONS` | `2` | Max answer-refinement passes before refusal |
 
 Errors map to meaningful status codes (via `ApiExceptionHandler`): **400** for a bad request
 (unknown source / missing param), **503** when a source is not configured.
@@ -248,7 +284,12 @@ Errors map to meaningful status codes (via `ApiExceptionHandler`): **400** for a
 ```
 src/main/java/com/ai/chatbot/
 ├── AiChatbotApplication.java         # @SpringBootApplication, @EnableScheduling
-├── config/                           # @ConfigurationProperties (sftp, notion, schedule)
+├── config/                           # @ConfigurationProperties (sftp, notion, schedule, guardrail)
+│                                     #   + ChatClientConfig (shared RAG ChatClient + advisors)
+├── guard/                            # self-refinement guardrail
+│   ├── InputGuard.java               # llama-guard3 safety + llama3.2 off-topic screen
+│   ├── ResponseRefiner.java          # llama3.2 relevancy judge + mistral refine loop
+│   └── SelfRefinementAdvisor.java    # CallAdvisor wrapping the QA advisor
 ├── controller/
 │   ├── VectorStoreController.java    # /api/vectors  (ad-hoc ingest + search)
 │   ├── RagChatController.java        # /api/chat     (RAG)
